@@ -1,0 +1,17 @@
+{
+  "name": "todo-list-life-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A client-side start page with a personalized greeting, focus timer, color-coded to-do list, and quick links. No runtime frameworks or libraries; all behavior in one vanilla JS file, all data in Local Storage.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "fast-check": "^4.10.2",
+    "jsdom": "^30.1.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}

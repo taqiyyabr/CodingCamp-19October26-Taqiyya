@@ -1,0 +1,1295 @@
+(function () {
+  'use strict';
+
+  // ============================================================
+  // Storage Layer
+  // Wraps Local Storage with JSON serialization, availability
+  // detection, and graceful error handling. Every other module
+  // reads and writes through this layer.
+  // ------------------------------------------------------------
+  // Filled in by task 2.1.
+  // ============================================================
+
+  // Storage keys (all namespaced under "tld.")
+  var STORAGE_KEY_USER_NAME = 'tld.user.name';
+  var STORAGE_KEY_TASKS = 'tld.tasks';
+  var STORAGE_KEY_QUICK_LINKS = 'tld.quickLinks';
+  var STORAGE_KEY_THEME = 'tld.theme';
+
+  // Memoized availability check result
+  var _availabilityCache = null;
+
+  var Storage = {
+    // (memoized) real test write/remove to detect availability
+    // Safari private mode reports availability but throws on writes or returns null on read
+    isAvailable: function () {
+      if (_availabilityCache !== null) {
+        return _availabilityCache;
+      }
+
+      try {
+        // Test write
+        var testKey = '_tld_availability_test_' + Date.now();
+        localStorage.setItem(testKey, 'test');
+        
+        // Test read
+        var value = localStorage.getItem(testKey);
+        
+        // Test remove
+        localStorage.removeItem(testKey);
+        
+        // Verify read after remove returns null
+        var afterRemove = localStorage.getItem(testKey);
+        
+        // All operations succeeded and remove worked
+        _availabilityCache = (value === 'test' && afterRemove === null);
+        return _availabilityCache;
+      } catch (e) {
+        _availabilityCache = false;
+        return false;
+      }
+    },
+    // JSON.parse, returns fallback on miss or parse error
+    load: function (key, fallback) {
+      try {
+        var value = localStorage.getItem(key);
+        if (value === null) {
+          return fallback;
+        }
+        return JSON.parse(value);
+      } catch (e) {
+        return fallback;
+      }
+    },
+    // JSON.stringify in try/catch, returns boolean success
+    save: function (key, value) {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+    // try/catch removal
+    remove: function (key) {
+      try {
+        localStorage.removeItem(key);
+      } catch (e) {
+        // Silently fail on removal errors
+      }
+    }
+  };
+
+  // ============================================================
+  // Pure Logic Functions
+  // No DOM, no Local Storage. Isolated so they can be verified
+  // with property-based tests and exported to Node via the
+  // CommonJS guard at the bottom of the IIFE.
+  // ============================================================
+
+  // ------------------------------------------------------------
+  // Greeting pure logic — task 3.1
+  // ------------------------------------------------------------
+
+  // hour 0-23 -> greeting string
+  function getGreeting(hour) {
+    // 5-11: Good Morning, 12-16: Good Afternoon, 0-4/17-23: Good Evening
+    if (hour >= 5 && hour <= 11) {
+      return 'Good Morning';
+    } else if (hour >= 12 && hour <= 16) {
+      return 'Good Afternoon';
+    } else {
+      return 'Good Evening';
+    }
+  }
+
+  // Date -> "HH:MM" string (24-hour format)
+  function formatTime(date) {
+    var hours = date.getHours();
+    var minutes = date.getMinutes();
+    var paddedHours = hours < 10 ? '0' + hours : hours;
+    var paddedMinutes = minutes < 10 ? '0' + minutes : minutes;
+    return paddedHours + ':' + paddedMinutes;
+  }
+
+  // Date -> "YYYY-MM-DD" string
+  function formatDate(date) {
+    var year = date.getFullYear();
+    var month = date.getMonth() + 1; // Month is 0-indexed
+    var day = date.getDate();
+    var paddedMonth = month < 10 ? '0' + month : month;
+    var paddedDay = day < 10 ? '0' + day : day;
+    return year + '-' + month + '-' + paddedDay;
+  }
+
+  // name -> valid saveable? (1-20 chars, letters/numbers/spaces only)
+  function isValidUserName(name) {
+    if (typeof name !== 'string') {
+      return false;
+    }
+    var trimmed = name.trim();
+    if (trimmed.length < 1 || trimmed.length > 20) {
+      return false;
+    }
+    // Only letters, numbers, and spaces allowed
+    var regex = /^[a-zA-Z0-9 ]+$/;
+    return regex.test(trimmed);
+  }
+
+  // ------------------------------------------------------------
+  // Timer pure logic — task 4.1
+  // ------------------------------------------------------------
+
+  var TIMER_DURATION_SECONDS = 1500; // 25 * 60
+
+  // Timer state: { remainingSeconds: number, isRunning: boolean }
+
+  // seconds 0-1500 -> "MM:SS"
+  function formatTimer(state) {
+    var remaining = state.remainingSeconds !== undefined ? state.remainingSeconds : (state.totalTime - state.elapsed);
+    var minutes = Math.floor(remaining / 60);
+    var seconds = remaining % 60;
+    var paddedMinutes = minutes < 10 ? '0' + minutes : minutes;
+    var paddedSeconds = seconds < 10 ? '0' + seconds : seconds;
+    return paddedMinutes + ':' + paddedSeconds;
+  }
+
+  // next timer state after one tick (clamped at 0, stops at 0)
+  function tickTimer(state) {
+    if (!state.isRunning) {
+      return state;
+    }
+    
+    var remaining = state.remainingSeconds !== undefined ? state.remainingSeconds : (state.totalTime - state.elapsed);
+    
+    if (remaining <= 0) {
+      // Already at zero, stop
+      return {
+        remainingSeconds: 0,
+        isRunning: false
+      };
+    }
+    
+    return {
+      remainingSeconds: remaining - 1,
+      isRunning: true
+    };
+  }
+
+  // next state after reset (always 1500, stopped)
+  function resetTimer(state) {
+    return {
+      remainingSeconds: TIMER_DURATION_SECONDS,
+      isRunning: false
+    };
+  }
+
+  // set initial total time (for flexible timer setup)
+  function setTimer(seconds) {
+    var total = Math.max(0, Math.min(seconds, TIMER_DURATION_SECONDS));
+    return {
+      remainingSeconds: total,
+      isRunning: false
+    };
+  }
+
+  // ------------------------------------------------------------
+  // TaskList pure logic — task 5.1
+  // ------------------------------------------------------------
+
+  // text -> valid? (1 <= trimmed length <= 200)
+  function validateTaskText(text) {
+    if (typeof text !== 'string') {
+      return false;
+    }
+    var trimmed = text.trim();
+    return trimmed.length >= 1 && trimmed.length <= 200;
+  }
+
+  // color -> one of red|yellow|green
+  function isValidColor(color) {
+    return color === 'red' || color === 'yellow' || color === 'green';
+  }
+
+  // tasks -> new array sorted red, yellow, green (stable within color)
+  function sortTasks(tasks) {
+    var colorOrder = { 'red': 0, 'yellow': 1, 'green': 2 };
+    return tasks.slice().sort(function (a, b) {
+      var orderA = colorOrder[a.color] || 3;
+      var orderB = colorOrder[b.color] || 3;
+      if (orderA === orderB) {
+        // Stable sort: maintain relative order within same color
+        return 0;
+      }
+      return orderA - orderB;
+    });
+  }
+
+  // create a Task object with a generated id
+  function createTask(text, color) {
+    var id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 
+             'task_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
+    return {
+      id: id,
+      text: text,
+      color: color,
+      done: false
+    };
+  }
+
+  // return new array with task appended
+  function addTaskToList(tasks, task) {
+    return tasks.concat([task]);
+  }
+
+  // return new array without the task matching id
+  function removeTaskFromList(tasks, id) {
+    return tasks.filter(function (t) {
+      return t.id !== id;
+    });
+  }
+
+  // return new array with updated text and color, preserving id, done, position
+  function editTaskInList(tasks, id, text, color) {
+    return tasks.map(function (t) {
+      if (t.id === id) {
+        return {
+          id: t.id,
+          text: text,
+          color: color,
+          done: t.done
+        };
+      }
+      return t;
+    });
+  }
+
+  // return new array with done flipped for the matching task
+  function toggleTaskDoneInList(tasks, id) {
+    return tasks.map(function (t) {
+      if (t.id === id) {
+        return {
+          id: t.id,
+          text: t.text,
+          color: t.color,
+          done: !t.done
+        };
+      }
+      return t;
+    });
+  }
+
+  // ------------------------------------------------------------
+  // QuickLinks pure logic — task 6.1
+  // ------------------------------------------------------------
+
+  // label+url -> { valid, error? }
+  function validateQuickLink(label, url) {
+    if (typeof label !== 'string' || label.trim() === '') {
+      return { valid: false, error: 'Label cannot be empty' };
+    }
+    if (typeof url !== 'string' || url.trim() === '') {
+      return { valid: false, error: 'URL cannot be empty' };
+    }
+    var trimmedUrl = url.trim();
+    if (!trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) {
+      return { valid: false, error: 'URL must start with http:// or https://' };
+    }
+    return { valid: true };
+  }
+
+  // create a QuickLink object with a generated id
+  function createQuickLink(label, url) {
+    var id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 
+             'link_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
+    return {
+      id: id,
+      label: label.trim(),
+      url: url.trim()
+    };
+  }
+
+  // return new array with link appended
+  function addLinkToSet(links, link) {
+    return links.concat([link]);
+  }
+
+  // return new array without the link matching id
+  function removeLinkFromSet(links, id) {
+    return links.filter(function (l) {
+      return l.id !== id;
+    });
+  }
+
+  // ------------------------------------------------------------
+  // Theme pure logic — task 7.1
+  // ------------------------------------------------------------
+
+  var DEFAULT_THEME = 'light';
+
+  // theme -> true only for "light" or "dark"
+  function isValidTheme(theme) {
+    return theme === 'light' || theme === 'dark';
+  }
+
+  // "dark" if theme is "light", "light" if theme is "dark"
+  function toggleTheme(theme) {
+    return theme === 'light' ? 'dark' : 'light';
+  }
+
+  // ------------------------------------------------------------
+  // Serialization helpers — task 8.1
+  // ------------------------------------------------------------
+
+  // Task array round-trip
+  function serializeTasks(tasks) {
+    return JSON.stringify(tasks);
+  }
+
+  function deserializeTasks(json) {
+    try {
+      var parsed = JSON.parse(json);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // QuickLink array round-trip
+  function serializeQuickLinks(links) {
+    return JSON.stringify(links);
+  }
+
+  function deserializeQuickLinks(json) {
+    try {
+      var parsed = JSON.parse(json);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // Theme round-trip
+  function serializeTheme(theme) {
+    return JSON.stringify(theme);
+  }
+
+  function deserializeTheme(json) {
+    try {
+      var parsed = JSON.parse(json);
+      return parsed === 'light' || parsed === 'dark' ? parsed : 'light';
+    } catch (e) {
+      return 'light';
+    }
+  }
+
+  // User name round-trip
+  function serializeUserName(name) {
+    return JSON.stringify(name);
+  }
+
+  function deserializeUserName(json) {
+    try {
+      var parsed = JSON.parse(json);
+      return typeof parsed === 'string' ? parsed : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // ============================================================
+  // DOM-dependent Modules
+  // Component namespaces that cache DOM nodes, wire events, and
+  // render. These run only in the browser (guarded by the DOM
+  // init guard near the bottom of the IIFE).
+  // ============================================================
+
+  // ------------------------------------------------------------
+  // Greeting namespace — task 10.1
+  // ------------------------------------------------------------
+  var Greeting = {
+    root: null,
+    greetingText: null,
+    greetingTime: null,
+    greetingDate: null,
+    greetingForm: null,
+    greetingNameInput: null,
+    intervalId: null,
+    userName: '',
+
+    init: function (root) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      this.root = root;
+      this.greetingText = root.querySelector('#greeting-text');
+      this.greetingTime = root.querySelector('#greeting-time');
+      this.greetingDate = root.querySelector('#greeting-date');
+      this.greetingForm = root.querySelector('#greeting-form');
+      this.greetingNameInput = root.querySelector('#greeting-name-input');
+
+      // Load saved name from Storage
+      this.userName = Storage.load(STORAGE_KEY_USER_NAME, 'Guest');
+
+      // Start 1-second interval to update clock
+      this.intervalId = setInterval(function () {
+        Greeting.render();
+      }, 1000);
+
+      // Wire name edit form
+      if (this.greetingForm && this.greetingNameInput) {
+        this.greetingForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var name = this.greetingNameInput.value;
+          Greeting.setName(name);
+        }.bind(this));
+
+        // Pre-fill the input with loaded name
+        this.greetingNameInput.value = this.userName;
+      }
+    },
+
+    render: function () {
+      var now = new Date();
+      var hour = now.getHours();
+      var timeStr = formatTime(now);
+      var dateStr = formatDate(now);
+      var greeting = getGreeting(hour);
+
+      // Update time and date display
+      if (this.greetingTime) {
+        this.greetingTime.textContent = timeStr;
+      }
+      if (this.greetingDate) {
+        this.greetingDate.textContent = dateStr;
+      }
+      if (this.greetingText) {
+        this.greetingText.textContent = greeting;
+      }
+
+      // Update name display if we have a greeting name input
+      if (this.greetingNameInput) {
+        this.greetingNameInput.value = this.userName;
+      }
+    },
+
+    setName: function (name) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Validate name
+      if (!isValidUserName(name)) {
+        return;
+      }
+
+      // Trim the name
+      var trimmedName = name.trim();
+
+      // Silently do nothing if name is empty after trim
+      if (trimmedName === '') {
+        return;
+      }
+
+      // Save to Storage
+      Storage.save(STORAGE_KEY_USER_NAME, trimmedName);
+
+      // Update local state
+      this.userName = trimmedName;
+
+      // Re-render
+      this.render();
+
+      // Update input value
+      if (this.greetingNameInput) {
+        this.greetingNameInput.value = trimmedName;
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  // Timer namespace — task 11.1
+  // ------------------------------------------------------------
+  var Timer = {
+    root: null,
+    display: null,
+    completeIndicator: null,
+    startBtn: null,
+    stopBtn: null,
+    resetBtn: null,
+    intervalId: null,
+    state: {
+      remainingSeconds: TIMER_DURATION_SECONDS,
+      isRunning: false
+    },
+
+    init: function (root) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      this.root = root;
+      this.display = root.querySelector('#timer-display');
+      this.completeIndicator = root.querySelector('#timer-complete');
+      this.startBtn = root.querySelector('#timer-start');
+      this.stopBtn = root.querySelector('#timer-stop');
+      this.resetBtn = root.querySelector('#timer-reset');
+
+      // Wire event listeners
+      if (this.startBtn) {
+        this.startBtn.addEventListener('click', function () {
+          Timer.start();
+        });
+      }
+      if (this.stopBtn) {
+        this.stopBtn.addEventListener('click', function () {
+          Timer.stop();
+        });
+      }
+      if (this.resetBtn) {
+        this.resetBtn.addEventListener('click', function () {
+          Timer.reset();
+        });
+      }
+
+      // Set initial render
+      Timer.render();
+    },
+
+    start: function () {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Don't start if already running
+      if (this.state.isRunning) {
+        return;
+      }
+
+      this.state.isRunning = true;
+
+      // Clear any existing interval to prevent duplicates
+      if (this.intervalId) {
+        clearInterval(this.intervalId);
+      }
+
+      // Start interval - tick every second
+      this.intervalId = setInterval(function () {
+        // Decrement remaining time
+        if (this.state.remainingSeconds > 0) {
+          this.state.remainingSeconds--;
+          Timer.render();
+        } else {
+          // Timer completed
+          Timer.stop();
+          Timer.render();
+          // Show completion message
+          if (this.completeIndicator) {
+            this.completeIndicator.textContent = 'Timer Completed!';
+          }
+        }
+      }.bind(this), 1000);
+    },
+
+    stop: function () {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Stop the timer
+      this.state.isRunning = false;
+
+      // Clear the interval
+      if (this.intervalId) {
+        clearInterval(this.intervalId);
+        this.intervalId = null;
+      }
+    },
+
+    reset: function () {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Stop the timer
+      Timer.stop();
+
+      // Reset state
+      this.state.remainingSeconds = TIMER_DURATION_SECONDS;
+      this.state.isRunning = false;
+
+      // Clear completion message
+      if (this.completeIndicator) {
+        this.completeIndicator.textContent = '';
+      }
+
+      // Render updated state
+      Timer.render();
+    },
+
+    render: function () {
+      // Update the display with formatted time
+      if (this.display) {
+        this.display.textContent = formatTimer(this.state);
+      }
+
+      // Update completion indicator based on state
+      if (this.completeIndicator) {
+        if (this.state.remainingSeconds === 0 && !this.state.isRunning) {
+          if (this.completeIndicator.textContent !== 'Timer Completed!') {
+            this.completeIndicator.textContent = 'Timer Completed!';
+          }
+        } else if (this.state.remainingSeconds > 0) {
+          // Clear completion message when there's time remaining
+          this.completeIndicator.textContent = '';
+        }
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  // TaskList namespace — task 12.1
+  // ------------------------------------------------------------
+  var TaskList = {
+    root: null,
+    taskForm: null,
+    taskTextInput: null,
+    taskColorSelect: null,
+    taskList: null,
+    taskError: null,
+    tasks: [], // in-memory state
+
+    init: function (root) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      this.root = root;
+      this.taskForm = root.querySelector('#task-form');
+      this.taskTextInput = root.querySelector('#task-text');
+      this.taskColorSelect = root.querySelector('#task-color');
+      this.taskList = root.querySelector('#task-list');
+      this.taskError = root.querySelector('#task-error');
+
+      // Wire add form
+      if (this.taskForm && this.taskTextInput && this.taskColorSelect) {
+        this.taskForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var text = this.taskTextInput.value;
+          var color = this.taskColorSelect.value;
+          TaskList.add(text, color);
+        }.bind(this));
+      }
+
+      // Load tasks from Storage
+      TaskList.load();
+    },
+
+    add: function (text, color) {
+      // Validate text
+      if (!validateTaskText(text)) {
+        this.showError('Task text must be between 1 and 200 characters');
+        return;
+      }
+
+      // Validate color
+      if (!isValidColor(color)) {
+        this.showError('Invalid color selected');
+        return;
+      }
+
+      // Trim the text
+      var trimmedText = text.trim();
+
+      // Create task
+      var task = createTask(trimmedText, color);
+
+      // Add to list
+      this.tasks = addTaskToList(this.tasks, task);
+
+      // Render and persist
+      TaskList.render();
+      TaskList.persist();
+    },
+
+    edit: function (id, text, color) {
+      // Validate text
+      if (!validateTaskText(text)) {
+        this.showError('Task text must be between 1 and 200 characters');
+        return;
+      }
+
+      // Validate color
+      if (!isValidColor(color)) {
+        this.showError('Invalid color selected');
+        return;
+      }
+
+      // Trim the text
+      var trimmedText = text.trim();
+
+      // Update task
+      this.tasks = editTaskInList(this.tasks, id, trimmedText, color);
+
+      // Render and persist
+      TaskList.render();
+      TaskList.persist();
+    },
+
+    toggleDone: function (id) {
+      // Toggle task done status
+      this.tasks = toggleTaskDoneInList(this.tasks, id);
+
+      // Render and persist
+      TaskList.render();
+      TaskList.persist();
+    },
+
+    remove: function (id) {
+      // Remove task
+      this.tasks = removeTaskFromList(this.tasks, id);
+
+      // Render and persist
+      TaskList.render();
+      TaskList.persist();
+    },
+
+    sort: function () {
+      // Sort tasks
+      this.tasks = sortTasks(this.tasks);
+
+      // Render and persist
+      TaskList.render();
+      TaskList.persist();
+    },
+
+    render: function () {
+      // Clear the list
+      if (this.taskList) {
+        this.taskList.innerHTML = '';
+      }
+
+      // Render each task
+      this.tasks.forEach(function (task) {
+        var li = document.createElement('li');
+        li.className = 'task-item';
+        li.setAttribute('data-id', task.id);
+        li.setAttribute('data-color', task.color);
+
+        // Add done class if task is completed
+        if (task.done) {
+          li.className += ' task-item--done';
+        }
+
+        // Color indicator
+        var colorIndicator = document.createElement('span');
+        colorIndicator.className = 'task-item__color';
+        colorIndicator.style.backgroundColor = task.color;
+        li.appendChild(colorIndicator);
+
+        // Task text with strikethrough if done
+        var textSpan = document.createElement('span');
+        textSpan.className = 'task-item__text';
+        textSpan.textContent = task.text;
+        if (task.done) {
+          textSpan.style.textDecoration = 'line-through';
+        }
+        li.appendChild(textSpan);
+
+        // Color label
+        var colorLabel = document.createElement('span');
+        colorLabel.className = 'task-item__color-label';
+        colorLabel.textContent = '(' + task.color + ')';
+        li.appendChild(colorLabel);
+
+        // Done toggle button
+        var toggleBtn = document.createElement('button');
+        toggleBtn.className = 'task-item__toggle';
+        toggleBtn.type = 'button';
+        toggleBtn.textContent = task.done ? 'Undo' : 'Done';
+        toggleBtn.setAttribute('aria-label', task.done ? 'Mark as not done' : 'Mark as done');
+        toggleBtn.addEventListener('click', function () {
+          TaskList.toggleDone(task.id);
+        });
+        li.appendChild(toggleBtn);
+
+        // Edit button
+        var editBtn = document.createElement('button');
+        editBtn.className = 'task-item__edit';
+        editBtn.type = 'button';
+        editBtn.textContent = 'Edit';
+        editBtn.setAttribute('aria-label', 'Edit task');
+        editBtn.addEventListener('click', function () {
+          // Create a simple edit form inline
+          var textInput = document.createElement('input');
+          textInput.type = 'text';
+          textInput.value = task.text;
+          textInput.maxLength = 200;
+          textInput.style.marginRight = '5px';
+
+          var colorSelect = document.createElement('select');
+          colorSelect.innerHTML = '<option value="red">Red</option><option value="yellow">Yellow</option><option value="green">Green</option>';
+          colorSelect.value = task.color;
+          colorSelect.style.marginRight = '5px';
+
+          var saveBtn = document.createElement('button');
+          saveBtn.type = 'button';
+          saveBtn.textContent = 'Save';
+          saveBtn.addEventListener('click', function () {
+            TaskList.edit(task.id, textInput.value, colorSelect.value);
+            li.replaceWith(li); // Re-render this item
+          });
+
+          var cancelBtn = document.createElement('button');
+          cancelBtn.type = 'button';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', function () {
+            li.replaceWith(li); // Re-render this item (no-op, keeps original)
+          });
+
+          li.insertBefore(textInput, textSpan);
+          li.insertBefore(colorSelect, textSpan);
+          li.insertBefore(saveBtn, textSpan);
+          li.insertBefore(cancelBtn, textSpan);
+          textInput.focus();
+        });
+        li.appendChild(editBtn);
+
+        // Delete button
+        var deleteBtn = document.createElement('button');
+        deleteBtn.className = 'task-item__delete';
+        deleteBtn.type = 'button';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.setAttribute('aria-label', 'Delete task');
+        deleteBtn.addEventListener('click', function () {
+          TaskList.remove(task.id);
+        });
+        li.appendChild(deleteBtn);
+
+        if (this.taskList) {
+          this.taskList.appendChild(li);
+        }
+      }.bind(this));
+    },
+
+    load: function () {
+      // Read from Storage
+      var storedTasks = Storage.load(STORAGE_KEY_TASKS, []);
+
+      // If missing or corrupt, use empty array
+      if (!Array.isArray(storedTasks)) {
+        storedTasks = [];
+      }
+
+      // Validate each task
+      this.tasks = storedTasks.filter(function (task) {
+        return (
+          task &&
+          typeof task.id === 'string' &&
+          typeof task.text === 'string' &&
+          typeof task.color === 'string' &&
+          isValidColor(task.color) &&
+          typeof task.done === 'boolean'
+        );
+      });
+
+      // Render
+      TaskList.render();
+    },
+
+    persist: function () {
+      // Save to Storage
+      var success = Storage.save(STORAGE_KEY_TASKS, this.tasks);
+
+      // If save fails, show error and keep current display
+      if (!success) {
+        this.showError('Failed to save tasks. Please try again.');
+      } else {
+        // Clear any existing error on successful save
+        this.clearError();
+      }
+    },
+
+    showError: function (message) {
+      if (this.taskError) {
+        this.taskError.textContent = message;
+        // Clear error after 3 seconds
+        setTimeout(function () {
+          this.clearError();
+        }.bind(this), 3000);
+      }
+    },
+
+    clearError: function () {
+      if (this.taskError) {
+        this.taskError.textContent = '';
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  // QuickLinks namespace — task 13.1
+  // ------------------------------------------------------------
+  var QuickLinks = {
+    root: null,
+    linkForm: null,
+    linkLabelInput: null,
+    linkUrlInput: null,
+    linkList: null,
+    linkError: null,
+    links: [], // in-memory state
+
+    init: function (root) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      this.root = root;
+      this.linkForm = root.querySelector('#link-form');
+      this.linkLabelInput = root.querySelector('#link-label');
+      this.linkUrlInput = root.querySelector('#link-url');
+      this.linkList = root.querySelector('#link-list');
+      this.linkError = root.querySelector('#link-error');
+
+      // Wire add form
+      if (this.linkForm && this.linkLabelInput && this.linkUrlInput) {
+        this.linkForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var label = this.linkLabelInput.value;
+          var url = this.linkUrlInput.value;
+          QuickLinks.add(label, url);
+        }.bind(this));
+      }
+
+      // Load links from Storage
+      QuickLinks.load();
+    },
+
+    add: function (label, url) {
+      // Validate link
+      var validation = validateQuickLink(label, url);
+      if (!validation.valid) {
+        this.showError(validation.error);
+        return;
+      }
+
+      // Create link
+      var link = createQuickLink(label, url);
+
+      // Add to set
+      this.links = addLinkToSet(this.links, link);
+
+      // Render and persist
+      QuickLinks.render();
+      QuickLinks.persist();
+    },
+
+    remove: function (id) {
+      // Remove link via pure logic
+      this.links = removeLinkFromSet(this.links, id);
+
+      // Render and persist
+      QuickLinks.render();
+      QuickLinks.persist();
+    },
+
+    render: function () {
+      // Clear the list
+      if (this.linkList) {
+        this.linkList.innerHTML = '';
+      }
+
+      // Render each link as an anchor
+      this.links.forEach(function (link) {
+        var li = document.createElement('li');
+        li.className = 'link-item';
+        li.setAttribute('data-id', link.id);
+
+        var a = document.createElement('a');
+        a.href = link.url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = link.label;
+
+        li.appendChild(a);
+
+        // Remove button
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.textContent = 'Remove';
+        removeBtn.setAttribute('aria-label', 'Remove link');
+        removeBtn.addEventListener('click', function () {
+          QuickLinks.remove(link.id);
+        });
+        li.appendChild(removeBtn);
+
+        if (this.linkList) {
+          this.linkList.appendChild(li);
+        }
+      }.bind(this));
+    },
+
+    load: function () {
+      // Read from Storage
+      var storedLinks = Storage.load(STORAGE_KEY_QUICK_LINKS, []);
+
+      // If missing or corrupt, use empty array
+      if (!Array.isArray(storedLinks)) {
+        storedLinks = [];
+      }
+
+      // Validate each link
+      this.links = storedLinks.filter(function (link) {
+        return (
+          link &&
+          typeof link.id === 'string' &&
+          typeof link.label === 'string' &&
+          typeof link.url === 'string'
+        );
+      });
+
+      // Render
+      QuickLinks.render();
+    },
+
+    persist: function () {
+      // Save to Storage
+      var success = Storage.save(STORAGE_KEY_QUICK_LINKS, this.links);
+
+      // If save fails, show error and keep current display
+      if (!success) {
+        this.showError('Failed to save quick links. Please try again.');
+      } else {
+        // Clear any existing error on successful save
+        this.clearError();
+      }
+    },
+
+    showError: function (message) {
+      if (this.linkError) {
+        this.linkError.textContent = message;
+        // Clear error after 3 seconds
+        setTimeout(function () {
+          this.clearError();
+        }.bind(this), 3000);
+      }
+    },
+
+    clearError: function () {
+      if (this.linkError) {
+        this.linkError.textContent = '';
+      }
+    }
+  };
+
+  // ------------------------------------------------------------
+  // Theme namespace — task 14.1
+  // ------------------------------------------------------------
+  var Theme = {
+    root: null,
+    toggleButton: null,
+
+    init: function (root) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      this.root = root;
+      this.toggleButton = root.querySelector('#theme-toggle');
+
+      // Load saved theme and apply
+      Theme.load();
+    },
+
+    apply: function (theme) {
+      // Validate theme
+      if (!isValidTheme(theme)) {
+        theme = DEFAULT_THEME;
+      }
+
+      // Set data-theme on html element
+      var htmlElement = document.documentElement;
+      if (htmlElement) {
+        htmlElement.setAttribute('data-theme', theme);
+      }
+
+      // Update toggle button UI
+      if (this.toggleButton) {
+        this.toggleButton.setAttribute('aria-pressed', theme === 'dark');
+        this.toggleButton.textContent = theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme';
+      }
+    },
+
+    toggle: function () {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Load current theme, toggle it, apply, and persist
+      var currentTheme = Theme.load();
+      var newTheme = toggleTheme(currentTheme);
+      Theme.apply(newTheme);
+      Theme.persist(newTheme);
+    },
+
+    load: function () {
+      // Read from Storage
+      var storedTheme = Storage.load(STORAGE_KEY_THEME, DEFAULT_THEME);
+
+      // Validate with isValidTheme, default to light if invalid
+      if (!isValidTheme(storedTheme)) {
+        storedTheme = DEFAULT_THEME;
+      }
+
+      // Apply the loaded theme
+      Theme.apply(storedTheme);
+
+      return storedTheme;
+    },
+
+    persist: function (theme) {
+      // Return early if Storage is not available
+      if (!Storage.isAvailable()) {
+        return;
+      }
+
+      // Validate theme before saving
+      if (!isValidTheme(theme)) {
+        return;
+      }
+
+      // Save to Storage
+      Storage.save(STORAGE_KEY_THEME, theme);
+    }
+  };
+
+  // ============================================================
+  // Bootstrap / Init
+  // Wires all modules on DOMContentLoaded. Runs only in the
+  // browser (guarded by the DOM init guard below).
+  // ------------------------------------------------------------
+  // Filled in by task 15.1.
+  // ============================================================
+
+  function init() {
+    // Detect Storage availability - return early if not available
+    if (!Storage.isAvailable()) {
+      return;
+    }
+
+    // Initialize Theme FIRST (apply before paint to avoid flash of wrong theme)
+    Theme.init(document.body);
+
+    // Initialize Greeting (loads user name, starts clock)
+    var greetingRoot = document.querySelector('#greeting-section');
+    if (greetingRoot) {
+      Greeting.init(greetingRoot);
+    }
+
+    // Initialize Timer (wires timer controls)
+    var timerRoot = document.querySelector('#timer-section');
+    if (timerRoot) {
+      Timer.init(timerRoot);
+    }
+
+    // Initialize TaskList (wires task form)
+    var taskRoot = document.querySelector('#task-section');
+    if (taskRoot) {
+      TaskList.init(taskRoot);
+    }
+
+    // Initialize QuickLinks (wires link form)
+    var linksRoot = document.querySelector('#link-section');
+    if (linksRoot) {
+      QuickLinks.init(linksRoot);
+    }
+
+    // Wire global event listeners
+    // Theme toggle button
+    var themeToggle = document.querySelector('#theme-toggle');
+    if (themeToggle) {
+      themeToggle.addEventListener('click', function () {
+        Theme.toggle();
+      });
+    }
+  }
+
+  // ============================================================
+  // DOM init guard
+  // The DOM initialization code (DOMContentLoaded listener + bootstrap)
+  // does NOT run in Node tests, where there is no document object.
+  // ============================================================
+  if (typeof document !== 'undefined') {
+    document.addEventListener('DOMContentLoaded', init);
+  }
+
+  // ============================================================
+  // CommonJS export guard
+  // Exports the pure-logic functions for Node tests (fast-check +
+  // Vitest + jsdom). package.json omits "type": "module", so this
+  // file is treated as CommonJS and this guard fires when required.
+  // The same source file therefore feeds both the browser app
+  // (IIFE + DOM init) and the test suite (pure-logic exports).
+  // ============================================================
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      // Storage layer
+      STORAGE_KEY_USER_NAME: STORAGE_KEY_USER_NAME,
+      STORAGE_KEY_TASKS: STORAGE_KEY_TASKS,
+      STORAGE_KEY_QUICK_LINKS: STORAGE_KEY_QUICK_LINKS,
+      STORAGE_KEY_THEME: STORAGE_KEY_THEME,
+      Storage: Storage,
+      // Greeting pure logic
+      getGreeting: getGreeting,
+      formatTime: formatTime,
+      formatDate: formatDate,
+      isValidUserName: isValidUserName,
+      // Timer pure logic
+      TIMER_DURATION_SECONDS: TIMER_DURATION_SECONDS,
+      formatTimer: formatTimer,
+      tickTimer: tickTimer,
+      resetTimer: resetTimer,
+      setTimer: setTimer,
+      // TaskList pure logic
+      validateTaskText: validateTaskText,
+      isValidColor: isValidColor,
+      sortTasks: sortTasks,
+      createTask: createTask,
+      addTaskToList: addTaskToList,
+      removeTaskFromList: removeTaskFromList,
+      editTaskInList: editTaskInList,
+      toggleTaskDoneInList: toggleTaskDoneInList,
+      // QuickLinks pure logic
+      validateQuickLink: validateQuickLink,
+      createQuickLink: createQuickLink,
+      addLinkToSet: addLinkToSet,
+      removeLinkFromSet: removeLinkFromSet,
+      // Theme pure logic
+      DEFAULT_THEME: DEFAULT_THEME,
+      isValidTheme: isValidTheme,
+      toggleTheme: toggleTheme,
+      // Theme DOM module
+      Theme: Theme,
+      // Serialization helpers
+      serializeTasks: serializeTasks,
+      deserializeTasks: deserializeTasks,
+      serializeQuickLinks: serializeQuickLinks,
+      deserializeQuickLinks: deserializeQuickLinks,
+      serializeTheme: serializeTheme,
+      deserializeTheme: deserializeTheme,
+      serializeUserName: serializeUserName,
+      deserializeUserName: deserializeUserName
+    };
+  }
+})();
